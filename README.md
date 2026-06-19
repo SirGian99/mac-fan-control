@@ -18,6 +18,10 @@ Management Controller (SMC)** over IOKit.
 
 > Built and verified on a MacBook Pro (M5 Pro, macOS 26). **Apple Silicon only.**
 
+<p align="center">
+  <img src="Resources/screenshot.png" width="320" alt="Fan Control menu bar popover">
+</p>
+
 ## Features
 
 - 📊 **Live RPM readout** for every fan
