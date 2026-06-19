@@ -308,15 +308,15 @@ struct FanView: View {
             }
             .disabled(!model.hasFans)
 
-            // Always present with a fixed height: a status line that appears
-            // and disappears would resize the view, and NSPopover clips/shifts
-            // its content whenever the hosting view changes size.
-            Text(model.status)
-                .font(.caption2)
-                .foregroundStyle(.red)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, minHeight: 14, alignment: .leading)
+            // Shown only when there's something to report. The popover is
+            // .applicationDefined, so it resizes cleanly when this appears.
+            if !model.status.isEmpty {
+                Text(model.status)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             Divider()
             HStack {
