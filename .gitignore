@@ -1,0 +1,10 @@
+# Swift / SwiftPM build output
+.build/
+.swiftpm/
+Package.resolved
+
+# Built app bundle (produced by build-app.sh)
+FanControl.app/
+
+# macOS
+.DS_Store
