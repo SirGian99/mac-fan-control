@@ -43,23 +43,31 @@ do {
     switch command {
     case "status", "":
         let status = try fc.status()
+        let temps = fc.temperatures()
         if args.contains("--json") {
-            let payload: [String: Any] = [
+            var payload: [String: Any] = [
                 "allManual": status.allManual,
                 "fans": status.fans.map { [
                     "index": $0.index, "actual": $0.actual, "min": $0.minRPM,
                     "max": $0.maxRPM, "target": $0.target, "manual": $0.manual,
                 ] },
             ]
+            if let c = temps.cpu { payload["cpuTempC"] = c }
+            if let g = temps.gpu { payload["gpuTempC"] = g }
             let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
             print(String(data: data, encoding: .utf8) ?? "{}")
-        } else if status.fans.isEmpty {
-            print("No fans reported (FNum = 0). This Mac may be fanless (e.g. a MacBook Air).")
         } else {
-            for f in status.fans {
-                print(String(format: "Fan %d: %5.0f rpm   [min %.0f, max %.0f]   target %.0f   (%@)",
-                             f.index, f.actual, f.minRPM, f.maxRPM, f.target, f.manual ? "manual" : "auto"))
+            if status.fans.isEmpty {
+                print("No fans reported (FNum = 0). This Mac may be fanless (e.g. a MacBook Air).")
+            } else {
+                for f in status.fans {
+                    print(String(format: "Fan %d: %5.0f rpm   [min %.0f, max %.0f]   target %.0f   (%@)",
+                                 f.index, f.actual, f.minRPM, f.maxRPM, f.target, f.manual ? "manual" : "auto"))
+                }
             }
+            let unit = TemperatureUnit.system
+            if let c = temps.cpu { print("CPU: \(unit.format(celsius: c))") }
+            if let g = temps.gpu { print("GPU: \(unit.format(celsius: g))") }
         }
 
     case "set":

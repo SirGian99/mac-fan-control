@@ -14,6 +14,8 @@ final class FanModel: ObservableObject {
     @Published var maxRPM: Double = 6000
     @Published var status = ""
     @Published var alwaysAuthorize = false
+    @Published var cpuTemp: Double?
+    @Published var gpuTemp: Double?
 
     /// True while an admin prompt / privileged action is in flight, so the
     /// popover doesn't dismiss out from under it.
@@ -41,6 +43,9 @@ final class FanModel: ObservableObject {
             let s = try c.status()
             fans = s.fans
             manual = s.allManual
+            let t = c.temperatures()
+            cpuTemp = t.cpu
+            gpuTemp = t.gpu
             if let f = s.fans.first {
                 if f.minRPM > 0 { minRPM = f.minRPM }
                 if f.maxRPM > 0 { maxRPM = f.maxRPM }
@@ -259,6 +264,21 @@ struct FanView: View {
                         Spacer()
                         Text("\(Int(f.actual)) rpm").monospacedDigit().foregroundStyle(.secondary)
                     }
+                }
+            }
+
+            if let cpu = model.cpuTemp {
+                HStack {
+                    Text("CPU")
+                    Spacer()
+                    Text(TemperatureUnit.system.format(celsius: cpu)).monospacedDigit().foregroundStyle(.secondary)
+                }
+            }
+            if let gpu = model.gpuTemp {
+                HStack {
+                    Text("GPU")
+                    Spacer()
+                    Text(TemperatureUnit.system.format(celsius: gpu)).monospacedDigit().foregroundStyle(.secondary)
                 }
             }
 

@@ -25,6 +25,7 @@ Management Controller (SMC)** over IOKit.
 ## Features
 
 - 📊 **Live RPM readout** for every fan
+- 🌡️ **CPU & GPU temperatures**, shown in your system's unit (°C / °F)
 - 🎚️ **Manual speed** control with a slider, clamped to each fan's safe min/max
 - 🔄 **Auto mode** to return control to macOS at any time
 - 🖥️ A **menu bar app** (number-only readout) **and** a `fan` **CLI**, on one core
@@ -48,6 +49,10 @@ set of four-character keys:
 Setting a speed writes `F{n}md = 1` then `F{n}Tg = <rpm>`. Returning to auto
 writes `F{n}md = 0`. (The code also falls back to the legacy uppercase `F{n}Md` /
 `FS!` keys used by older Macs.)
+
+Temperatures are read by averaging the SMC's `Tp*` (performance-core) and `Tg*`
+(GPU) `flt` sensors into one figure each, and shown in whatever unit you've set
+in **System Settings → Language & Region → Temperature** (°C or °F).
 
 - **Reading** RPMs works as a normal user.
 - **Writing** requires **root** — the SMC gates write commands. The app uses the
@@ -130,6 +135,8 @@ Example:
 $ fan status
 Fan 0:  1351 rpm   [min 1350, max 5349]   target 1350   (auto)
 Fan 1:  1453 rpm   [min 1350, max 5777]   target 1458   (auto)
+CPU: 46°C
+GPU: 41°C
 
 $ sudo fan set 3000
 Set 2 fan(s) → 3000 rpm (manual)

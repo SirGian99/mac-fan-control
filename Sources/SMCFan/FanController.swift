@@ -1,5 +1,29 @@
 import Foundation
 
+/// The temperature unit the user has chosen in System Settings, used to format
+/// the °C values the SMC reports.
+public enum TemperatureUnit {
+    case celsius, fahrenheit
+
+    /// Follows System Settings → Language & Region → Temperature, falling back
+    /// to the current locale's measurement system if that preference is unset.
+    public static var system: TemperatureUnit {
+        if let pref = UserDefaults.standard.string(forKey: "AppleTemperatureUnit") {
+            return pref.lowercased().hasPrefix("f") ? .fahrenheit : .celsius
+        }
+        if Locale.current.measurementSystem == .us { return .fahrenheit }
+        return .celsius
+    }
+
+    /// Format a Celsius reading for display in this unit (e.g. "46°C" / "115°F").
+    public func format(celsius: Double) -> String {
+        switch self {
+        case .celsius:    return String(format: "%.0f°C", celsius)
+        case .fahrenheit: return String(format: "%.0f°F", celsius * 9.0 / 5.0 + 32.0)
+        }
+    }
+}
+
 public struct FanInfo {
     public let index: Int
     public let actual: Double   // current RPM
@@ -17,6 +41,12 @@ public struct FanStatus {
 /// High-level fan reads/writes built on top of the raw SMC keys.
 public final class FanController {
     let smc: SMC
+
+    // Temperature sensor keys, discovered once (enumerating all SMC keys is slow).
+    private var cpuSensorKeys: [String] = []
+    private var gpuSensorKeys: [String] = []
+    private var sensorsDiscovered = false
+
     public init() throws { smc = try SMC() }
 
     // MARK: - SMC value coding
@@ -98,6 +128,42 @@ public final class FanController {
     func modeKey(_ i: Int) -> String? {
         for k in ["F\(i)md", "F\(i)Md"] where smc.keyExists(k) { return k }
         return nil
+    }
+
+    // MARK: - Temperatures
+
+    /// Average CPU (P-core cluster) and GPU temperatures in °C, or nil if the
+    /// machine exposes no such sensors. On Apple Silicon these come from many
+    /// `Tp*` / `Tg*` `flt` sensors, which we average into one figure each.
+    public func temperatures() -> (cpu: Double?, gpu: Double?) {
+        discoverSensors()
+        return (averageTemp(cpuSensorKeys), averageTemp(gpuSensorKeys))
+    }
+
+    private func discoverSensors() {
+        guard !sensorsDiscovered else { return }
+        sensorsDiscovered = true
+        guard let count = try? smc.keyCount() else { return }
+        for i in 0..<count {
+            guard let key = try? smc.keyFromIndex(i), key.count == 4 else { continue }
+            let isCPU = key.hasPrefix("Tp")   // performance-core cluster
+            let isGPU = key.hasPrefix("Tg")   // GPU cluster
+            guard isCPU || isGPU,
+                  let (type, bytes) = try? smc.read(key), type == "flt " else { continue }
+            let v = FanController.decode(type: type, bytes: bytes)
+            guard v > 5 && v < 130 else { continue }   // sanity-bound to real °C
+            if isCPU { cpuSensorKeys.append(key) } else { gpuSensorKeys.append(key) }
+        }
+    }
+
+    private func averageTemp(_ keys: [String]) -> Double? {
+        var sum = 0.0, n = 0
+        for k in keys {
+            guard let (type, bytes) = try? smc.read(k) else { continue }
+            let v = FanController.decode(type: type, bytes: bytes)
+            if v > 0 { sum += v; n += 1 }
+        }
+        return n > 0 ? sum / Double(n) : nil
     }
 
     func isManual(_ i: Int) -> Bool {
