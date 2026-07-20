@@ -37,15 +37,17 @@ final class FanModel: ObservableObject {
         if let f = fans.first { sliderRPM = f.target > 0 ? f.target : f.actual }
     }
 
-    func refresh() {
+    func refresh(includeTemps: Bool = true) {
         guard let c = controller else { status = "Cannot open SMC"; return }
         do {
             let s = try c.status()
             fans = s.fans
             manual = s.allManual
-            let t = c.temperatures()
-            cpuTemp = t.cpu
-            gpuTemp = t.gpu
+            if includeTemps {
+                let t = c.temperatures()
+                cpuTemp = t.cpu
+                gpuTemp = t.gpu
+            }
             if let f = s.fans.first {
                 if f.minRPM > 0 { minRPM = f.minRPM }
                 if f.maxRPM > 0 { maxRPM = f.maxRPM }
@@ -358,7 +360,7 @@ struct FanView: View {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private let model = FanModel()
@@ -378,9 +380,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         popover.behavior = .applicationDefined   // don't auto-close on focus loss (auth prompts, edits)
-        let host = NSHostingController(rootView: FanView(model: model))
-        host.sizingOptions = [.preferredContentSize]   // popover tracks the (now constant) content size
-        popover.contentViewController = host
+        popover.delegate = self
+        // The SwiftUI content is created only while the popover is open (see
+        // togglePopover / popoverDidClose). A hidden NSHostingView otherwise
+        // sits in a continuous layout loop and burns CPU in the background.
 
         // Click outside still dismisses the popover — but not while an auth
         // prompt or other privileged action is in flight.
@@ -389,11 +392,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.popover.performClose(nil)
         }
 
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        // Light background poll for the menu-bar number. Temperatures (many SMC
+        // reads) are gathered only while the popover is actually open.
+        timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             guard let self else { return }
-            self.model.refresh()
+            self.model.refresh(includeTemps: self.popover.isShown)
             self.updateTitle()
         }
+        model.refresh(includeTemps: false)
         updateTitle()
     }
 
@@ -435,11 +441,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         if popover.isShown {
             popover.performClose(sender)
-        } else {
-            model.refresh()
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
+            return
         }
+        model.refresh()   // full state (incl temps) before building the view
+        let host = NSHostingController(rootView: FanView(model: model))
+        popover.contentViewController = host
+        host.view.layoutSubtreeIfNeeded()
+        let fit = host.view.fittingSize
+        popover.contentSize = NSSize(width: max(fit.width, 280), height: max(fit.height, 200))
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
+    }
+
+    // Tear down the SwiftUI view when the popover closes so nothing renders in
+    // the background (the fix for the idle-CPU / layout-loop problem).
+    func popoverDidClose(_ notification: Notification) {
+        popover.contentViewController = nil
     }
 }
 
