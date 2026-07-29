@@ -8,10 +8,18 @@ func usage() {
     USAGE
       fan [status]              Show fan RPMs and mode        (no root needed)
       fan status --json        Machine-readable status        (no root needed)
+      fan keys [F|all|PREFIX]  Dump SMC keys (read-only, no root). Default
+                               prefix "F" (fan keys); "all"/"" dumps everything.
       sudo fan set <rpm>       Force ALL fans to <rpm> rpm (manual)
       sudo fan set <rpm> -f N  Force only fan N
       sudo fan max             Force all fans to their maximum
-      sudo fan auto            Restore automatic fan control
+      sudo fan auto [-f IDX]   Restore automatic fan control (all fans,
+                               or only fan IDX)
+      sudo fan supervise <rpm> [--interval MS] [--temp-margin C] [--epsilon RPM] [--once]
+                               Enforce a software minimum-RPM floor: keep fans
+                               in macOS auto whenever the firmware wants >= the
+                               floor, forcing them up to the floor only while
+                               cool. Ctrl-C restores automatic.
 
     Setting speed writes to the SMC, which requires root — prefix with sudo.
     Manual mode persists until you run `fan auto` or reboot.
@@ -32,6 +40,16 @@ func requireRoot(_ action: String) {
 func optValue(_ args: [String], _ flag: String) -> String? {
     guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
     return args[i + 1]
+}
+
+/// Set from the SIGINT/SIGTERM handlers below; polled by the supervisor loop's
+/// `shouldStop` closure. `sig_atomic_t` is the only type safe to touch from a C
+/// signal handler.
+var stopRequested: sig_atomic_t = 0
+
+/// C-compatible (non-capturing) signal handler installed for SIGINT/SIGTERM.
+func handleStopSignal(_ signal: Int32) {
+    stopRequested = 1
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
@@ -91,9 +109,107 @@ do {
         print("Set all fans → maximum (manual)")
 
     case "auto":
-        requireRoot("auto")
-        try fc.setAuto()
-        print("Restored automatic fan control")
+        if let raw = optValue(args, "-f") ?? optValue(args, "--fan"), let idx = Int(raw) {
+            requireRoot("auto -f \(idx)")
+            try fc.setManual(false, fan: idx)
+            print("Fan \(idx) → automatic")
+        } else {
+            requireRoot("auto")
+            try fc.setAuto()
+            print("Restored automatic fan control")
+        }
+
+    case "supervise":
+        guard args.count >= 2, let rpm = Double(args[1]) else { usage(); exit(2) }
+        if (try? fc.fanCount()) ?? 0 == 0 { err("No controllable fans on this Mac."); exit(1) }
+        requireRoot("supervise \(Int(rpm))")
+
+        let intervalMs = Int(optValue(args, "--interval") ?? "") ?? 2000
+        let tempMargin = Double(optValue(args, "--temp-margin") ?? "") ?? 4.0
+        let epsilon    = Double(optValue(args, "--epsilon") ?? "") ?? 50
+
+        let supervisor = MinFloorSupervisor(
+            controller: fc,
+            floorRPM: rpm,
+            intervalMs: intervalMs,
+            releaseTempMarginC: tempMargin,
+            epsilonRPM: epsilon,
+            log: { print($0) }
+        )
+
+        if args.contains("--once") {
+            print("supervise --once: single control step at floor \(Int(rpm)) rpm")
+            try supervisor.stepOnce()
+            try supervisor.restoreAuto()
+            print("Done; automatic fan control restored.")
+        } else {
+            print("Minimum-fan-speed supervisor")
+            print("  floor       = \(Int(rpm)) rpm")
+            print("  interval    = \(intervalMs) ms")
+            print(String(format: "  temp-margin = %.1f C", tempMargin))
+            print("  epsilon     = \(Int(epsilon)) rpm")
+            print("Fans stay in macOS auto whenever the firmware wants >= floor; forced up to the floor only while cool.")
+            print("A held fan is left STEADY and handed back to macOS when temperature climbs — no periodic probing.")
+            print("Press Ctrl-C to stop (restores automatic).")
+
+            signal(SIGINT, handleStopSignal)
+            signal(SIGTERM, handleStopSignal)
+
+            // run() restores automatic in its own defer, so Ctrl-C (which sets
+            // stopRequested) hands the fans back to the firmware on the way out.
+            try supervisor.run(shouldStop: { stopRequested != 0 })
+            print("Stopped; automatic fan control restored.")
+        }
+
+    case "keys":
+        // READ-ONLY SMC key enumeration/diagnostic. No writes, no root needed.
+        let smc = try SMC()
+        let total = try smc.keyCount()
+
+        // Optional fourcc prefix filter. Default "F" (fan keys); "all"/""/"*"
+        // dumps everything.
+        let filterArg = args.count >= 2 ? args[1] : "F"
+        let prefix = (filterArg == "all" || filterArg == "*") ? "" : filterArg
+
+        // Types FanController.decode() understands as numbers.
+        let numericTypes: Set<String> = ["flt ", "fpe2", "fp2e", "ui8 ", "ui8",
+                                         "si8 ", "si8", "ui16", "si16", "ui32"]
+
+        print("SMC key count: \(total)")
+        print(prefix.isEmpty ? "Dumping ALL keys" : "Filter: keys starting with \"\(prefix)\"")
+
+        var shown = 0
+        for i in 0..<total {
+            guard let name = try? smc.keyFromIndex(i) else { continue }
+            guard prefix.isEmpty || name.hasPrefix(prefix) else { continue }
+
+            var type = "?"
+            var size = -1
+            var value = "<unreadable>"
+            do {
+                let (t, bytes) = try smc.read(name)
+                type = t
+                size = bytes.count
+                if numericTypes.contains(t) {
+                    value = String(format: "%g", FanController.decode(type: t, bytes: bytes))
+                } else {
+                    let hex = bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
+                    value = "0x[\(hex)]"
+                    // Best-effort ASCII for string-ish / flag types.
+                    if t == "ch8*" || t == "flag" || t.hasPrefix("{")
+                        || bytes.allSatisfy({ $0 == 0 || ($0 >= 0x20 && $0 < 0x7f) }) {
+                        let ascii = String(bytes: bytes.filter { $0 != 0 }, encoding: .ascii) ?? ""
+                        if !ascii.isEmpty { value += " \"\(ascii)\"" }
+                    }
+                }
+            } catch {
+                value = "<read error: \(error)>"
+            }
+
+            print(String(format: "%@  type=\"%@\"  size=%d  value=%@", name, type, size, value))
+            shown += 1
+        }
+        print("(\(shown) key(s) shown of \(total) total)")
 
     case "-h", "--help", "help":
         usage()
