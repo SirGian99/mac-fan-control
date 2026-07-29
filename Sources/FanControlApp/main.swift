@@ -4,6 +4,9 @@ import SMCFan
 
 // MARK: - Model
 
+/// The three fan-control modes exposed by the UI.
+enum FanControlMode: String { case automatic, minimum }
+
 /// Observable state for the popover. Reads run in-process (no privilege);
 /// writes are delegated to the bundled `fan` CLI via an admin prompt.
 final class FanModel: ObservableObject {
@@ -14,6 +17,10 @@ final class FanModel: ObservableObject {
     @Published var maxRPM: Double = 6000
     @Published var status = ""
     @Published var alwaysAuthorize = false
+    /// Current fan-control mode. `.automatic` hands all fans to firmware;
+    /// `.minimum` runs the per-fan floor supervisor so fans never drop below
+    /// `sliderRPM` (but the firmware may still ramp them higher under load).
+    @Published var mode: FanControlMode = .automatic
     @Published var cpuTemp: Double?
     @Published var gpuTemp: Double?
 
@@ -28,13 +35,31 @@ final class FanModel: ObservableObject {
 
     private let controller: FanController?
 
+    // Per-fan floor supervisor state (mirrors MinFloorSupervisor). `sliderRPM`
+    // is the floor value.
+    private var holding: [Int: Bool] = [:]
+    private var holdBaselineTemp: [Int: Double] = [:]
+    private var blindTicks: [Int: Int] = [:]
+    private let releaseTempMarginC = 4.0
+    private let epsilonRPM = 50.0
+    private let blindProbeTicks = 15   // ~30s at 2s ticks
+
     init() {
         controller = try? FanController()
         // Trust the saved preference only if the privileged helper is still present.
         alwaysAuthorize = UserDefaults.standard.bool(forKey: "alwaysAuthorize")
             && FileManager.default.fileExists(atPath: installedHelper)
+        mode = FanControlMode(rawValue: UserDefaults.standard.string(forKey: "fanControlMode") ?? "") ?? .automatic
         refresh()
         if let f = fans.first { sliderRPM = f.target > 0 ? f.target : f.actual }
+
+        // Launch reconciliation: if Minimum was on but we can't act silently
+        // (no passwordless helper yet), start clean in Automatic to avoid a
+        // surprise prompt at launch. Otherwise the supervisor timer resumes it.
+        if mode == .minimum
+            && !(alwaysAuthorize && FileManager.default.fileExists(atPath: installedHelper)) {
+            mode = .automatic
+        }
     }
 
     func refresh(includeTemps: Bool = true) {
@@ -51,7 +76,7 @@ final class FanModel: ObservableObject {
             if let f = s.fans.first {
                 if f.minRPM > 0 { minRPM = f.minRPM }
                 if f.maxRPM > 0 { maxRPM = f.maxRPM }
-                if !manual && (sliderRPM < minRPM || sliderRPM > maxRPM) {
+                if mode == .automatic && (sliderRPM < minRPM || sliderRPM > maxRPM) {
                     sliderRPM = min(max(f.actual, minRPM), maxRPM)
                 }
             }
@@ -61,14 +86,102 @@ final class FanModel: ObservableObject {
         }
     }
 
-    func setMode(manual on: Bool) {
-        if on { runPrivileged(["set", String(Int(sliderRPM.rounded()))]) }
-        else  { runPrivileged(["auto"]) }
+    /// Ensure the scoped passwordless rule is installed so we can act without a
+    /// prompt on every change. Shows ONE admin prompt the first time. Returns
+    /// whether we're authorized afterward.
+    @discardableResult
+    private func ensureAuthorized() -> Bool {
+        // Already authorized AND the installed helper matches this build's `fan`
+        // (a mismatch means a stale rule/helper from an older version — reinstall
+        // so the scoped commands stay current instead of silently failing).
+        if alwaysAuthorize
+            && FileManager.default.fileExists(atPath: installedHelper)
+            && installedHelperIsCurrent() {
+            return true
+        }
+        enableAlwaysAuthorize()   // one admin prompt; sets alwaysAuthorize on success
+        return alwaysAuthorize
+    }
+
+    /// True if the root-owned helper is byte-identical to this build's bundled
+    /// `fan`, i.e. the passwordless install is current (not from an older version).
+    private func installedHelperIsCurrent() -> Bool {
+        guard let installed = FileManager.default.contents(atPath: installedHelper),
+              let current = FileManager.default.contents(atPath: helperPath()) else { return false }
+        return installed == current
+    }
+
+    func setMode(_ newMode: FanControlMode) {
+        let previous = mode
+        // Minimum mode actuates the fans, so authorize once up front.
+        if newMode != .automatic {
+            guard ensureAuthorized() else {
+                mode = previous
+                status = "Controlling fans needs authorization."
+                return
+            }
+        }
+        mode = newMode
+        UserDefaults.standard.set(newMode.rawValue, forKey: "fanControlMode")
+        holding.removeAll(); holdBaselineTemp.removeAll(); blindTicks.removeAll()
+        switch newMode {
+        case .automatic:
+            runPrivileged(["auto"])
+        case .minimum:
+            superviseTick()                                            // react immediately
+        }
     }
 
     func applySpeed() {
-        guard manual else { return }
-        runPrivileged(["set", String(Int(sliderRPM.rounded()))])
+        switch mode {
+        case .automatic:
+            break
+        case .minimum:
+            // push the new floor immediately to any fan currently being held
+            let floor = Int(sliderRPM.rounded())
+            for (i, held) in holding where held {
+                runPrivileged(["set", String(floor), "-f", String(i)])
+            }
+        }
+    }
+
+    /// One iteration of the per-fan floor supervisor, sharing `floorFanAction`
+    /// with the CLI's MinFloorSupervisor.
+    func superviseTick() {
+        guard mode == .minimum, let c = controller else { return }
+        let floor = sliderRPM.rounded()
+        let temps = c.temperatures()
+        let machineTemp = [temps.cpu, temps.gpu].compactMap { $0 }.max()
+        guard let s = try? c.status(), !s.fans.isEmpty else { return }
+        for f in s.fans {
+            let i = f.index
+            let action = floorFanAction(
+                holding: holding[i] ?? false,
+                firmwareTarget: f.target,
+                machineTemp: machineTemp,
+                holdBaseline: holdBaselineTemp[i],
+                priorBlindTicks: blindTicks[i] ?? 0,
+                floorRPM: floor, epsilonRPM: epsilonRPM,
+                releaseTempMarginC: releaseTempMarginC, blindProbeTicks: blindProbeTicks)
+            switch action {
+            case .enterHold:
+                runPrivileged(["set", String(Int(floor)), "-f", String(i)])
+                holding[i] = true; holdBaselineTemp[i] = machineTemp; blindTicks[i] = 0
+            case .release:
+                runPrivileged(["auto", "-f", String(i)])
+                holding[i] = false; holdBaselineTemp[i] = nil; blindTicks[i] = 0
+            case .stayHold:
+                if machineTemp == nil { blindTicks[i] = (blindTicks[i] ?? 0) + 1 } else { blindTicks[i] = 0 }
+            case .stayAuto:
+                break
+            }
+        }
+    }
+
+    /// Called on quit: hand the fans back to the firmware synchronously if we
+    /// were holding a floor or in manual mode.
+    func shutdownRestoreAuto() {
+        if mode != .automatic || manual { runPrivileged(["auto"]) }
     }
 
     private func beginPrivileged() { isPerformingPrivilegedAction = true }
@@ -121,11 +234,7 @@ final class FanModel: ObservableObject {
         return exeDir + "/fan"
     }
 
-    // MARK: - "Always authorize" (opt-in passwordless sudo)
-
-    func setAlwaysAuthorize(_ on: Bool) {
-        on ? enableAlwaysAuthorize() : disableAlwaysAuthorize()
-    }
+    // MARK: - Authorization (scoped passwordless sudo, installed automatically)
 
     private func enableAlwaysAuthorize() {
         // Install a root-owned copy of the helper and a sudoers rule scoped to
@@ -139,7 +248,7 @@ final class FanModel: ObservableObject {
         chown -R root:wheel /Library/FanControl
         chmod 755 /Library/FanControl /Library/FanControl/fanctl
         T="$(mktemp)"
-        printf '%s ALL=(root) NOPASSWD: /Library/FanControl/fanctl set [0-9]*, /Library/FanControl/fanctl auto, /Library/FanControl/fanctl max\\n' '\(NSUserName())' > "$T"
+        printf '%s ALL=(root) NOPASSWD: /Library/FanControl/fanctl set [0-9]*, /Library/FanControl/fanctl set [0-9]* -f [0-9], /Library/FanControl/fanctl auto, /Library/FanControl/fanctl auto -f [0-9], /Library/FanControl/fanctl max\\n' '\(NSUserName())' > "$T"
         if visudo -cf "$T" >/dev/null 2>&1; then
           install -m 0440 -o root -g wheel "$T" /etc/sudoers.d/fancontrol
           rm -f "$T"
@@ -208,7 +317,7 @@ final class FanModel: ObservableObject {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         // 1. Hand the fans back to macOS while the bundled helper still exists.
-        if manual { runPrivileged(["auto"]) }
+        if mode != .automatic || manual { runPrivileged(["auto"]) }
 
         // 2. Remove the passwordless-sudo helper + rule if "Always authorize" was on.
         if alwaysAuthorize || FileManager.default.fileExists(atPath: installedHelper) {
@@ -247,6 +356,20 @@ final class FanModel: ObservableObject {
 struct FanView: View {
     @ObservedObject var model: FanModel
 
+    private var sliderTitle: String {
+        switch model.mode {
+        case .automatic: return "Speed"
+        case .minimum: return "Minimum speed"
+        }
+    }
+
+    private var modeCaption: String {
+        switch model.mode {
+        case .automatic: return "macOS controls the fans automatically."
+        case .minimum: return "Fans won’t drop below this, but macOS can still speed them up under load."
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 6) {
@@ -264,7 +387,7 @@ struct FanView: View {
                     HStack {
                         Text("Fan \(f.index + 1)")
                         Spacer()
-                        Text("\(Int(f.actual)) rpm").monospacedDigit().foregroundStyle(.secondary)
+                        Text(verbatim: "\(Int(f.actual)) rpm").monospacedDigit().foregroundStyle(.secondary)
                     }
                 }
             }
@@ -286,49 +409,40 @@ struct FanView: View {
 
             Divider()
 
-            Picker("Mode", selection: Binding(
-                get: { model.manual },
-                set: { model.setMode(manual: $0) }
-            )) {
-                Text("Auto").tag(false)
-                Text("Manual").tag(true)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+            Toggle("Minimum fan speed", isOn: Binding(
+                get: { model.mode == .minimum },
+                set: { model.setMode($0 ? .minimum : .automatic) }
+            ))
+            .toggleStyle(.switch)
             .disabled(!model.hasFans)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text("Speed")
+                    Text(sliderTitle)
                     Spacer()
-                    Text("\(Int(model.sliderRPM)) rpm").monospacedDigit()
+                    Text(verbatim: "\(Int(model.sliderRPM)) rpm").monospacedDigit()
                 }
                 Slider(
                     value: $model.sliderRPM,
                     in: model.minRPM...max(model.maxRPM, model.minRPM + 1),
                     onEditingChanged: { editing in if !editing { model.applySpeed() } }
                 )
-                .disabled(!model.manual || !model.hasFans)
+                .disabled(model.mode == .automatic || !model.hasFans)
                 HStack {
-                    Text("min \(Int(model.minRPM))")
+                    Text(verbatim: "min \(Int(model.minRPM))")
                     Spacer()
-                    Text("max \(Int(model.maxRPM))")
+                    Text(verbatim: "max \(Int(model.maxRPM))")
                 }
                 .font(.caption2).foregroundStyle(.secondary)
-            }
-            .opacity(model.manual ? 1 : 0.5)
-
-            Divider()
-            VStack(alignment: .leading, spacing: 2) {
-                Toggle("Always authorize", isOn: Binding(
-                    get: { model.alwaysAuthorize },
-                    set: { model.setAlwaysAuthorize($0) }
-                ))
-                .toggleStyle(.switch)
-                Text("Skip the password prompt.")
+                Text(modeCaption)
                     .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if model.mode == .minimum {
+                    Text(model.manual ? "Holding floor" : "Auto — above floor")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
             }
-            .disabled(!model.hasFans)
+            .opacity(model.mode == .automatic ? 0.5 : 1)
 
             // Shown only when there's something to report. The popover is
             // .applicationDefined, so it resizes cleanly when this appears.
@@ -394,13 +508,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // Light background poll for the menu-bar number. Temperatures (many SMC
         // reads) are gathered only while the popover is actually open.
-        timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             guard let self else { return }
+            if self.model.mode == .minimum { self.model.superviseTick() }
             self.model.refresh(includeTemps: self.popover.isShown)
             self.updateTitle()
         }
         model.refresh(includeTemps: false)
         updateTitle()
+
+        showFirstRunAuthNoticeIfNeeded()
+    }
+
+    /// One-time heads-up (first launch only) that controlling the fans needs a
+    /// single admin authorization. A flag ensures it shows at most once, ever.
+    private func showFirstRunAuthNoticeIfNeeded() {
+        let key = "didShowAuthIntro"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        UserDefaults.standard.set(true, forKey: key)
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "One-time permission needed"
+        alert.informativeText = "To control your fans, FanControl needs administrator permission. "
+            + "The first time you turn on “Minimum fan speed,” macOS will ask for your password — just once. "
+            + "After that it adjusts the fans silently, and always hands control back to macOS when you switch it off or quit."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     /// On first launch after install, register the per-user LaunchAgent so the
@@ -457,6 +590,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // the background (the fix for the idle-CPU / layout-loop problem).
     func popoverDidClose(_ notification: Notification) {
         popover.contentViewController = nil
+    }
+
+    // Restore firmware AUTO on quit if we were holding a floor or in manual mode.
+    func applicationWillTerminate(_ notification: Notification) {
+        model.shutdownRestoreAuto()
     }
 }
 
