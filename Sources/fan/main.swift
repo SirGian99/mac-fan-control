@@ -15,11 +15,14 @@ func usage() {
       sudo fan max             Force all fans to their maximum
       sudo fan auto [-f IDX]   Restore automatic fan control (all fans,
                                or only fan IDX)
-      sudo fan supervise <rpm> [--interval MS] [--temp-margin C] [--epsilon RPM] [--once]
-                               Enforce a software minimum-RPM floor: keep fans
-                               in macOS auto whenever the firmware wants >= the
-                               floor, forcing them up to the floor only while
-                               cool. Ctrl-C restores automatic.
+      sudo fan supervise <rpm> [--interval MS] [--ramp-low C] [--ramp-high C] [--once]
+                               Enforce a software minimum-RPM floor via an
+                               app-driven linear ramp: the floor when cool,
+                               ramping to each fan's max between --ramp-low and
+                               --ramp-high °C. Fans are always driven by this app,
+                               never released, so they can't stall; macOS hardware
+                               throttling remains the ultimate backstop. Ctrl-C
+                               restores automatic.
 
     Setting speed writes to the SMC, which requires root — prefix with sudo.
     Manual mode persists until you run `fan auto` or reboot.
@@ -125,15 +128,15 @@ do {
         requireRoot("supervise \(Int(rpm))")
 
         let intervalMs = Int(optValue(args, "--interval") ?? "") ?? 2000
-        let tempMargin = Double(optValue(args, "--temp-margin") ?? "") ?? 4.0
-        let epsilon    = Double(optValue(args, "--epsilon") ?? "") ?? 50
+        let rampLow    = Double(optValue(args, "--ramp-low") ?? "") ?? 55
+        let rampHigh   = Double(optValue(args, "--ramp-high") ?? "") ?? 90
 
         let supervisor = MinFloorSupervisor(
             controller: fc,
             floorRPM: rpm,
             intervalMs: intervalMs,
-            releaseTempMarginC: tempMargin,
-            epsilonRPM: epsilon,
+            rampLowC: rampLow,
+            rampHighC: rampHigh,
             log: { print($0) }
         )
 
@@ -144,12 +147,12 @@ do {
             print("Done; automatic fan control restored.")
         } else {
             print("Minimum-fan-speed supervisor")
-            print("  floor       = \(Int(rpm)) rpm")
-            print("  interval    = \(intervalMs) ms")
-            print(String(format: "  temp-margin = %.1f C", tempMargin))
-            print("  epsilon     = \(Int(epsilon)) rpm")
-            print("Fans stay in macOS auto whenever the firmware wants >= floor; forced up to the floor only while cool.")
-            print("A held fan is left STEADY and handed back to macOS when temperature climbs — no periodic probing.")
+            print("  floor     = \(Int(rpm)) rpm")
+            print("  interval  = \(intervalMs) ms")
+            print(String(format: "  ramp-low  = %.0f C", rampLow))
+            print(String(format: "  ramp-high = %.0f C", rampHigh))
+            print("App-driven linear ramp: floor when cool, ramping to each fan's max between --ramp-low and --ramp-high °C.")
+            print("Fans are always driven by this app, never released, so they can't stall — macOS hardware throttling remains the ultimate backstop.")
             print("Press Ctrl-C to stop (restores automatic).")
 
             signal(SIGINT, handleStopSignal)
