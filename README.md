@@ -87,7 +87,7 @@ from the floor up to each fan's maximum) is:
 | 80 – 88 °C    | 75% of floor → max              |
 | 88 °C and up  | max                             |
 
-A small **~3 °C hysteresis** on the way down means a fan steps up as soon as the
+A small **~5 °C hysteresis** on the way down means a fan steps up as soon as the
 temperature reaches the next band, but only steps back down once it has cooled
 ~3 °C below the band's threshold — so it doesn't flap back and forth at a
 boundary. Because the speed is constant within a band, the fans adjust only at
@@ -201,7 +201,7 @@ below 60 °C, then 25% / 50% / 75% of the floor→max range at 60 / 70 / 80 °C,
 each fan's max at 88 °C), changing speed only when the temperature crosses a
 threshold. Its knobs: `--interval` (poll period, default 2000 ms), `--hysteresis`
 (how far below a band's threshold the temperature must fall before stepping back
-down, default 3 °C — keeps the fans from flapping at a boundary), and `--once`
+down, default 5 °C — keeps the fans from flapping at a boundary), and `--once`
 (run a single control step and exit).
 
 Example:

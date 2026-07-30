@@ -317,7 +317,7 @@ public final class MinFloorSupervisor {
                 floorRPM: Double,
                 intervalMs: Int = 2000,
                 curve: [FanCurveStep] = defaultFanCurve,
-                hysteresisC: Double = 3,
+                hysteresisC: Double = 5,
                 writeDeltaRPM: Double = 25,
                 log: ((String) -> Void)? = nil) {
         self.controller = controller

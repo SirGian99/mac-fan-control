@@ -41,7 +41,7 @@ final class FanModel: ObservableObject {
     // privileged write when the stepped target moves meaningfully.
     private var lastTarget: [Int: Double] = [:]
     private var lastStepIndex: [Int: Int] = [:]
-    private let hysteresisC = 3.0
+    private let hysteresisC = 5.0
     private let writeDeltaRPM = 25.0
 
     init() {
@@ -51,7 +51,13 @@ final class FanModel: ObservableObject {
             && FileManager.default.fileExists(atPath: installedHelper)
         mode = FanControlMode(rawValue: UserDefaults.standard.string(forKey: "fanControlMode") ?? "") ?? .automatic
         refresh()
-        if let f = fans.first { sliderRPM = f.target > 0 ? f.target : f.actual }
+        // Default the floor to the saved value, or to the fan's real minimum RPM
+        // — NOT the current fan speed, which isn't "the minimum".
+        if let saved = UserDefaults.standard.object(forKey: "floorRPM") as? Double, saved > 0 {
+            sliderRPM = min(max(saved, minRPM), maxRPM)
+        } else {
+            sliderRPM = minRPM
+        }
 
         // Launch reconciliation: if Minimum was on but we can't act silently
         // (no passwordless helper yet), start clean in Automatic to avoid a
@@ -77,7 +83,7 @@ final class FanModel: ObservableObject {
                 if f.minRPM > 0 { minRPM = f.minRPM }
                 if f.maxRPM > 0 { maxRPM = f.maxRPM }
                 if mode == .automatic && (sliderRPM < minRPM || sliderRPM > maxRPM) {
-                    sliderRPM = min(max(f.actual, minRPM), maxRPM)
+                    sliderRPM = min(max(sliderRPM, minRPM), maxRPM)
                 }
             }
             status = s.fans.isEmpty ? "No fans found" : ""
@@ -134,6 +140,8 @@ final class FanModel: ObservableObject {
     }
 
     func applySpeed() {
+        // Remember the chosen floor so it persists across launches.
+        UserDefaults.standard.set(sliderRPM, forKey: "floorRPM")
         switch mode {
         case .automatic:
             break

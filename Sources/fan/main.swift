@@ -129,7 +129,7 @@ do {
         requireRoot("supervise \(Int(rpm))")
 
         let intervalMs  = Int(optValue(args, "--interval") ?? "") ?? 2000
-        let hysteresis  = Double(optValue(args, "--hysteresis") ?? "") ?? 3
+        let hysteresis  = Double(optValue(args, "--hysteresis") ?? "") ?? 5
 
         let supervisor = MinFloorSupervisor(
             controller: fc,
