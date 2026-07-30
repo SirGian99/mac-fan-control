@@ -73,11 +73,15 @@ final class FanModel: ObservableObject {
                 cpuTemp = t.cpu
                 gpuTemp = t.gpu
             }
-            if let f = s.fans.first {
-                if f.minRPM > 0 { minRPM = f.minRPM }
-                if f.maxRPM > 0 { maxRPM = f.maxRPM }
+            // Span every fan's reported range, not just the first fan's — fans
+            // can have different limits (e.g. 5349 vs 5777 max). Per-fan clamping
+            // in setTarget still keeps each fan within its own [Mn, Mx].
+            if !s.fans.isEmpty {
+                if let lo = s.fans.map({ $0.minRPM }).filter({ $0 > 0 }).min() { minRPM = lo }
+                if let hi = s.fans.map({ $0.maxRPM }).filter({ $0 > 0 }).max() { maxRPM = hi }
                 if mode == .automatic && (sliderRPM < minRPM || sliderRPM > maxRPM) {
-                    sliderRPM = min(max(f.actual, minRPM), maxRPM)
+                    let ref = s.fans.first?.actual ?? minRPM
+                    sliderRPM = min(max(ref, minRPM), maxRPM)
                 }
             }
             status = s.fans.isEmpty ? "No fans found" : ""
