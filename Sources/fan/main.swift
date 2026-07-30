@@ -15,12 +15,13 @@ func usage() {
       sudo fan max             Force all fans to their maximum
       sudo fan auto [-f IDX]   Restore automatic fan control (all fans,
                                or only fan IDX)
-      sudo fan supervise <rpm> [--interval MS] [--ramp-low C] [--ramp-high C] [--once]
+      sudo fan supervise <rpm> [--interval MS] [--hysteresis C] [--once]
                                Enforce a software minimum-RPM floor via an
-                               app-driven linear ramp: the floor when cool,
-                               ramping to each fan's max between --ramp-low and
-                               --ramp-high °C. Fans are always driven by this app,
-                               never released, so they can't stall; macOS hardware
+                               app-driven stepped temperature curve (fixed speed
+                               per band; changes only at thresholds): the floor
+                               when cool, stepping up toward each fan's max as it
+                               heats up. Fans are always driven by this app, never
+                               released, so they can't stall; macOS hardware
                                throttling remains the ultimate backstop. Ctrl-C
                                restores automatic.
 
@@ -127,16 +128,14 @@ do {
         if (try? fc.fanCount()) ?? 0 == 0 { err("No controllable fans on this Mac."); exit(1) }
         requireRoot("supervise \(Int(rpm))")
 
-        let intervalMs = Int(optValue(args, "--interval") ?? "") ?? 2000
-        let rampLow    = Double(optValue(args, "--ramp-low") ?? "") ?? 55
-        let rampHigh   = Double(optValue(args, "--ramp-high") ?? "") ?? 90
+        let intervalMs  = Int(optValue(args, "--interval") ?? "") ?? 2000
+        let hysteresis  = Double(optValue(args, "--hysteresis") ?? "") ?? 3
 
         let supervisor = MinFloorSupervisor(
             controller: fc,
             floorRPM: rpm,
             intervalMs: intervalMs,
-            rampLowC: rampLow,
-            rampHighC: rampHigh,
+            hysteresisC: hysteresis,
             log: { print($0) }
         )
 
@@ -147,11 +146,16 @@ do {
             print("Done; automatic fan control restored.")
         } else {
             print("Minimum-fan-speed supervisor")
-            print("  floor     = \(Int(rpm)) rpm")
-            print("  interval  = \(intervalMs) ms")
-            print(String(format: "  ramp-low  = %.0f C", rampLow))
-            print(String(format: "  ramp-high = %.0f C", rampHigh))
-            print("App-driven linear ramp: floor when cool, ramping to each fan's max between --ramp-low and --ramp-high °C.")
+            print("  floor      = \(Int(rpm)) rpm")
+            print("  interval   = \(intervalMs) ms")
+            print(String(format: "  hysteresis = %.0f C", hysteresis))
+            print("Stepped temperature curve (fixed speed per band; changes only at thresholds):")
+            print("  temperature       speed (fraction of floor→max)")
+            print(String(format: "  < %.0f°C           floor", defaultFanCurve.first(where: { $0.fraction > 0 })?.minTempC ?? 0))
+            for step in defaultFanCurve where step.fraction > 0 {
+                print(String(format: "  ≥ %.0f°C          %.0f%%", step.minTempC, step.fraction * 100))
+            }
+            print("App-driven: the floor when cool, stepping up toward each fan's max as it heats up.")
             print("Fans are always driven by this app, never released, so they can't stall — macOS hardware throttling remains the ultimate backstop.")
             print("Press Ctrl-C to stop (restores automatic).")
 

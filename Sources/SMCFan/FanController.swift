@@ -233,19 +233,50 @@ public final class FanController {
     }
 }
 
-// MARK: - Shared ramp function
+// MARK: - Shared stepped fan curve
 
-/// Linear temperature→RPM ramp for Minimum-fan-speed mode, per fan.
-/// Returns the floor when cool, ramping linearly to the fan's max as temperature
-/// rises from `rampLowC` to `rampHighC`. Always >= floorRPM. If temperature is
-/// unreadable, returns the floor (hold the minimum, no ramp).
-public func floorRampTarget(machineTemp: Double?, floorRPM: Double, fanMaxRPM: Double,
-                            rampLowC: Double, rampHighC: Double) -> Double {
+/// One band of the stepped fan curve: at temperatures >= `minTempC`, run at
+/// `fraction` of the [floor, max] range (0 = floor, 1 = each fan's max).
+public struct FanCurveStep: Equatable {
+    public let minTempC: Double
+    public let fraction: Double
+    public init(minTempC: Double, fraction: Double) {
+        self.minTempC = minTempC; self.fraction = fraction
+    }
+}
+
+/// Default stepped curve: floor while cool, stepping up to max as it heats.
+public let defaultFanCurve: [FanCurveStep] = [
+    FanCurveStep(minTempC: 0,  fraction: 0.0),    // floor below 60 °C
+    FanCurveStep(minTempC: 60, fraction: 0.25),
+    FanCurveStep(minTempC: 70, fraction: 0.50),
+    FanCurveStep(minTempC: 80, fraction: 0.75),
+    FanCurveStep(minTempC: 88, fraction: 1.0),     // max at/above 88 °C
+]
+
+/// Pick the curve step index for the current temperature, starting from
+/// `current`, with downward hysteresis so the fan doesn't flap at a boundary:
+/// step UP as soon as temp reaches the next band's `minTempC`; step DOWN only
+/// once temp falls `hysteresisC` below the current band's `minTempC`. Returns
+/// `current` (clamped) unchanged when temperature is unreadable.
+public func fanCurveStep(current: Int, machineTemp: Double?,
+                         curve: [FanCurveStep], hysteresisC: Double) -> Int {
+    guard !curve.isEmpty else { return 0 }
+    let clampedCurrent = min(max(current, 0), curve.count - 1)
+    guard let t = machineTemp else { return clampedCurrent }
+    var idx = clampedCurrent
+    while idx + 1 < curve.count && t >= curve[idx + 1].minTempC { idx += 1 }
+    while idx > 0 && t < curve[idx].minTempC - hysteresisC { idx -= 1 }
+    return idx
+}
+
+/// Target RPM for a step: floor + fraction*(max - floor), never below the floor.
+public func fanCurveTarget(stepIndex: Int, floorRPM: Double, fanMaxRPM: Double,
+                           curve: [FanCurveStep]) -> Double {
     let ceiling = max(fanMaxRPM, floorRPM)
-    guard let t = machineTemp else { return floorRPM }
-    let span = max(1.0, rampHighC - rampLowC)
-    let frac = min(max((t - rampLowC) / span, 0.0), 1.0)
-    return floorRPM + frac * (ceiling - floorRPM)
+    guard !curve.isEmpty else { return floorRPM }
+    let frac = curve[min(max(stepIndex, 0), curve.count - 1)].fraction
+    return floorRPM + max(0.0, min(frac, 1.0)) * (ceiling - floorRPM)
 }
 
 // MARK: - Minimum-RPM supervisor
@@ -254,20 +285,23 @@ public func floorRampTarget(machineTemp: Double?, floorRPM: Double, fanMaxRPM: D
 /// minimum key (`F{n}Mn`) is read-only (firmware rejects writes with 0x86), so
 /// there is no native "auto-with-a-floor" mode.
 ///
-/// Strategy: keep every fan FORCED and drive its target ourselves along a linear
-/// temperature ramp — the user's floor while cool, sliding up to the fan's max as
-/// the machine heats up (see `floorRampTarget`). We NEVER release a fan to
-/// firmware AUTO while supervising: on this hardware the firmware idles fans to
-/// 0 rpm until quite warm, so any release while cool stalls them (and re-spinning
-/// from a dead stop takes seconds). Because we always drive the fans, they can't
-/// stall; they still ramp under load because we ramp them. Apple's hardware
-/// thermal throttle remains the ultimate backstop.
+/// Strategy: keep every fan FORCED and drive its target ourselves along a
+/// STEPPED temperature curve — the user's floor while cool, jumping up a band at
+/// a time toward the fan's max as the machine heats up (see `fanCurveStep` /
+/// `fanCurveTarget`). Within a band the target is constant, so the fans change
+/// only when the temperature crosses a boundary; downward hysteresis keeps them
+/// from flapping at a threshold. We NEVER release a fan to firmware AUTO while
+/// supervising: on this hardware the firmware idles fans to 0 rpm until quite
+/// warm, so any release while cool stalls them (and re-spinning from a dead stop
+/// takes seconds). Because we always drive the fans, they can't stall; they
+/// still step up under load because we step them. Apple's hardware thermal
+/// throttle remains the ultimate backstop.
 public final class MinFloorSupervisor {
     private let controller: FanController
     private let floorRPM: Double
     private let intervalMs: Int
-    private let rampLowC: Double
-    private let rampHighC: Double
+    private let curve: [FanCurveStep]
+    private let hysteresisC: Double
     private let writeDeltaRPM: Double
     private let log: ((String) -> Void)?
 
@@ -275,18 +309,22 @@ public final class MinFloorSupervisor {
     /// the SMC when the target moves meaningfully. Persisted across `stepOnce()`.
     private var lastTarget: [Int: Double] = [:]
 
+    /// Per-fan current curve band index, so hysteresis can be applied relative
+    /// to the band we're already in. Persisted across `stepOnce()`.
+    private var lastStepIndex: [Int: Int] = [:]
+
     public init(controller: FanController,
                 floorRPM: Double,
                 intervalMs: Int = 2000,
-                rampLowC: Double = 55,
-                rampHighC: Double = 90,
+                curve: [FanCurveStep] = defaultFanCurve,
+                hysteresisC: Double = 3,
                 writeDeltaRPM: Double = 25,
                 log: ((String) -> Void)? = nil) {
         self.controller = controller
         self.floorRPM = floorRPM
         self.intervalMs = intervalMs
-        self.rampLowC = rampLowC
-        self.rampHighC = rampHighC
+        self.curve = curve
+        self.hysteresisC = hysteresisC
         self.writeDeltaRPM = writeDeltaRPM
         self.log = log
     }
@@ -299,18 +337,23 @@ public final class MinFloorSupervisor {
         let machineTemp = [temps.cpu, temps.gpu].compactMap { $0 }.max()
         for i in 0..<n {
             let info = try controller.fan(i)
-            let target = floorRampTarget(machineTemp: machineTemp, floorRPM: floorRPM,
-                                         fanMaxRPM: info.maxRPM, rampLowC: rampLowC, rampHighC: rampHighC)
+            let idx = fanCurveStep(current: lastStepIndex[i] ?? 0, machineTemp: machineTemp,
+                                   curve: curve, hysteresisC: hysteresisC)
+            lastStepIndex[i] = idx
+            let target = fanCurveTarget(stepIndex: idx, floorRPM: floorRPM,
+                                        fanMaxRPM: info.maxRPM, curve: curve)
             // (Re)assert when the fan isn't forced yet (self-heal after sleep/wake) or
             // the target moved enough. setTarget clamps to the fan's [Mn, Mx].
+            // Within a band the target is constant, so no rewrites — exactly the
+            // "changes only at thresholds" behavior wanted.
             let last = lastTarget[i]
             if !info.manual || last == nil || abs(target - (last ?? -1)) >= writeDeltaRPM {
                 try controller.setManual(true, fan: i)
                 try controller.setTarget(rpm: target, fan: i)
                 lastTarget[i] = target
                 let tstr = machineTemp.map { String(format: "%.0f°C", $0) } ?? "?"
-                log?(String(format: "fan %d: %@ -> target %.0f rpm (floor %.0f, max %.0f)  actual=%.0f",
-                            i, tstr, target, floorRPM, info.maxRPM, info.actual))
+                log?(String(format: "fan %d: %@ -> band %d = %.0f rpm (floor %.0f, max %.0f)  actual=%.0f",
+                            i, tstr, idx, target, floorRPM, info.maxRPM, info.actual))
             }
         }
     }

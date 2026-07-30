@@ -36,11 +36,12 @@ final class FanModel: ObservableObject {
     private let controller: FanController?
 
     // Per-fan floor supervisor state (mirrors MinFloorSupervisor). `sliderRPM`
-    // is the floor value; `lastTarget` is the last commanded RPM per fan so we
-    // only re-issue a privileged write when the ramp target moves meaningfully.
+    // is the floor value; `lastTarget` is the last commanded RPM per fan and
+    // `lastStepIndex` the current curve band per fan, so we only re-issue a
+    // privileged write when the stepped target moves meaningfully.
     private var lastTarget: [Int: Double] = [:]
-    private let rampLowC = 55.0
-    private let rampHighC = 90.0
+    private var lastStepIndex: [Int: Int] = [:]
+    private let hysteresisC = 3.0
     private let writeDeltaRPM = 25.0
 
     init() {
@@ -123,6 +124,7 @@ final class FanModel: ObservableObject {
         mode = newMode
         UserDefaults.standard.set(newMode.rawValue, forKey: "fanControlMode")
         lastTarget.removeAll()
+        lastStepIndex.removeAll()
         switch newMode {
         case .automatic:
             runPrivileged(["auto"])
@@ -138,14 +140,17 @@ final class FanModel: ObservableObject {
         case .minimum:
             // Re-apply immediately with the new floor.
             lastTarget.removeAll()
+            lastStepIndex.removeAll()
             superviseTick()
         }
     }
 
-    /// One iteration of the per-fan floor supervisor, sharing `floorRampTarget`
-    /// with the CLI's MinFloorSupervisor. Fans are always driven (never released),
-    /// with the target ramping linearly from the floor to each fan's max as the
-    /// machine heats up.
+    /// One iteration of the per-fan floor supervisor, sharing `fanCurveStep` /
+    /// `fanCurveTarget` with the CLI's MinFloorSupervisor. Fans are always driven
+    /// (never released), with the target following a stepped temperature curve:
+    /// the floor when cool, stepping up toward each fan's max as the machine
+    /// heats up. Within a band the target is constant (with hysteresis at the
+    /// boundaries), so it changes only when temperature crosses a threshold.
     func superviseTick() {
         guard mode == .minimum, let c = controller else { return }
         let floor = sliderRPM.rounded()
@@ -154,8 +159,11 @@ final class FanModel: ObservableObject {
         guard let s = try? c.status(), !s.fans.isEmpty else { return }
         for f in s.fans {
             let i = f.index
-            let target = floorRampTarget(machineTemp: machineTemp, floorRPM: floor,
-                                         fanMaxRPM: f.maxRPM, rampLowC: rampLowC, rampHighC: rampHighC)
+            let idx = fanCurveStep(current: lastStepIndex[i] ?? 0, machineTemp: machineTemp,
+                                   curve: defaultFanCurve, hysteresisC: hysteresisC)
+            lastStepIndex[i] = idx
+            let target = fanCurveTarget(stepIndex: idx, floorRPM: floor,
+                                        fanMaxRPM: f.maxRPM, curve: defaultFanCurve)
             let last = lastTarget[i]
             if !f.manual || last == nil || abs(target - (last ?? -1)) >= writeDeltaRPM {
                 runPrivileged(["set", String(Int(target.rounded())), "-f", String(i)])
@@ -352,7 +360,7 @@ struct FanView: View {
     private var modeCaption: String {
         switch model.mode {
         case .automatic: return "macOS controls the fans automatically."
-        case .minimum: return "Fans won’t drop below this, and speed up automatically as your Mac heats up."
+        case .minimum: return "Fans won’t drop below this, and step up in stages as your Mac heats up."
         }
     }
 
