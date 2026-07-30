@@ -4,7 +4,7 @@ import SMCFan
 
 // MARK: - Model
 
-/// The three fan-control modes exposed by the UI.
+/// The two fan-control modes exposed by the UI.
 enum FanControlMode: String { case automatic, minimum }
 
 /// Observable state for the popover. Reads run in-process (no privilege);
@@ -40,8 +40,13 @@ final class FanModel: ObservableObject {
     private var holding: [Int: Bool] = [:]
     private var holdBaselineTemp: [Int: Double] = [:]
     private var blindTicks: [Int: Int] = [:]
-    private let releaseTempMarginC = 4.0
+    /// Fans currently mid-verify (released to observe, awaiting the settle
+    /// callback that reads the firmware's true intent). Skipped by the loop so
+    /// they aren't re-processed until the callback resolves them.
+    private var verifying: Set<Int> = []
+    private let releaseTempMarginC = 10.0
     private let epsilonRPM = 50.0
+    private let verifySettleSec = 0.8
     private let blindProbeTicks = 15   // ~30s at 2s ticks
 
     init() {
@@ -155,6 +160,9 @@ final class FanModel: ObservableObject {
         guard let s = try? c.status(), !s.fans.isEmpty else { return }
         for f in s.fans {
             let i = f.index
+            // A fan mid-verify is resolved by its async settle callback; don't
+            // re-process it here in the meantime.
+            if verifying.contains(i) { continue }
             let action = floorFanAction(
                 holding: holding[i] ?? false,
                 firmwareTarget: f.target,
@@ -168,8 +176,36 @@ final class FanModel: ObservableObject {
                 runPrivileged(["set", String(Int(floor)), "-f", String(i)])
                 holding[i] = true; holdBaselineTemp[i] = machineTemp; blindTicks[i] = 0
             case .release:
-                runPrivileged(["auto", "-f", String(i)])
-                holding[i] = false; holdBaselineTemp[i] = nil; blindTicks[i] = 0
+                if machineTemp == nil {
+                    // BLIND FAIL-SAFE: temperature unreadable, so we can't verify
+                    // the firmware's intent. Release to AUTO and trust the
+                    // firmware (the real thermal backstop) — do not verify.
+                    runPrivileged(["auto", "-f", String(i)])
+                    holding[i] = false; holdBaselineTemp[i] = nil; blindTicks[i] = 0
+                } else {
+                    // TEMP-TRIGGERED: a small temp rise doesn't prove the firmware
+                    // now wants >= the floor. Release to observe, then verify its
+                    // true intent after a short settle — WITHOUT blocking the main
+                    // thread. If it still wants < floor, re-hold so the fan can't
+                    // coast toward 0. Leave `holding[i]` as-is until the callback
+                    // resolves it; the fan is skipped via `verifying` meanwhile.
+                    runPrivileged(["auto", "-f", String(i)])
+                    verifying.insert(i)
+                    let floorNow = floor
+                    let baseTemp = machineTemp
+                    DispatchQueue.main.asyncAfter(deadline: .now() + verifySettleSec) { [weak self] in
+                        guard let self else { return }
+                        self.verifying.remove(i)
+                        guard self.mode == .minimum, let c = self.controller else { return }
+                        let tg = (try? c.fan(i).target) ?? 0
+                        if tg >= floorNow - self.epsilonRPM {
+                            self.holding[i] = false; self.holdBaselineTemp[i] = nil; self.blindTicks[i] = 0
+                        } else {
+                            self.runPrivileged(["set", String(Int(floorNow)), "-f", String(i)])
+                            self.holding[i] = true; self.holdBaselineTemp[i] = baseTemp; self.blindTicks[i] = 0
+                        }
+                    }
+                }
             case .stayHold:
                 if machineTemp == nil { blindTicks[i] = (blindTicks[i] ?? 0) + 1 } else { blindTicks[i] = 0 }
             case .stayAuto:

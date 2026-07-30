@@ -179,9 +179,12 @@ want "never below N rpm, but free to go faster", use `fan supervise` instead —
 it runs the exact same minimum-floor logic the menu bar app uses, in the
 foreground, and restores automatic control on Ctrl-C. Its knobs: `--interval`
 (poll period, default 2000 ms), `--temp-margin` (°C rise above the hold baseline
-before a held fan is released, default 4.0), `--epsilon` (RPM slack when
+before a held fan is released, default 10.0), `--epsilon` (RPM slack when
 comparing the firmware's target to the floor, default 50), and `--once` (run a
-single control step and exit).
+single control step and exit). Before a held fan is actually handed back, the
+supervisor verifies it against the firmware's real target — if the firmware
+still wants less than the floor, the fan is re-held immediately, so a minor
+temperature wiggle can't let it coast down toward 0.
 
 Example:
 

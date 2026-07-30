@@ -287,6 +287,7 @@ public final class MinFloorSupervisor {
     private let intervalMs: Int
     private let releaseTempMarginC: Double
     private let epsilonRPM: Double
+    private let verifySettleMs: Int
     private let log: ((String) -> Void)?
 
     /// Per-fan state (keyed by fan index): are we currently forcing this fan up
@@ -304,14 +305,16 @@ public final class MinFloorSupervisor {
     public init(controller: FanController,
                 floorRPM: Double,
                 intervalMs: Int = 2000,
-                releaseTempMarginC: Double = 4.0,
+                releaseTempMarginC: Double = 10.0,
                 epsilonRPM: Double = 50,
+                verifySettleMs: Int = 800,
                 log: ((String) -> Void)? = nil) {
         self.controller = controller
         self.floorRPM = floorRPM
         self.intervalMs = intervalMs
         self.releaseTempMarginC = releaseTempMarginC
         self.epsilonRPM = epsilonRPM
+        self.verifySettleMs = verifySettleMs
         self.log = log
     }
 
@@ -392,13 +395,38 @@ public final class MinFloorSupervisor {
                 // past the baseline, or (fail-safe) temperature has been
                 // unreadable for too long.
                 if let t = machineTemp, let b = holdBaselineTemp[i] {
-                    try controller.setManual(false, fan: i)   // release to AUTO
-                    holding[i] = false
-                    holdBaselineTemp[i] = nil
-                    blindTicks[i] = 0
-                    log?(String(format: "fan %d: HOLD -> release to AUTO (temp %.0f°C > base %.0f+%.0f)  actual=%.0f",
-                                i, t, b, releaseTempMarginC, actual))
+                    // TEMP-TRIGGERED: a small temp rise does NOT prove the
+                    // firmware now wants >= the floor (below its fan-on threshold
+                    // it may still want 0). Verify before committing to AUTO:
+                    // release to observe, let the firmware recompute, then read
+                    // its true intent. If it still wants < floor, re-hold at once
+                    // so the fan can't coast toward 0.
+                    try controller.setManual(false, fan: i)   // release to observe
+                    Thread.sleep(forTimeInterval: Double(verifySettleMs) / 1000.0)
+                    let intent = (try? controller.fan(i).target) ?? 0
+                    if intent >= floorRPM - epsilonRPM {
+                        // Firmware genuinely wants >= the floor: leave in AUTO.
+                        holding[i] = false
+                        holdBaselineTemp[i] = nil
+                        blindTicks[i] = 0
+                        log?(String(format: "fan %d: HOLD -> AUTO confirmed (firmware wants %.0f >= floor %.0f)  temp=%.0f°C base=%.0f  actual=%.0f",
+                                    i, intent, floorRPM, t, b, actual))
+                    } else {
+                        // Machine still cool: firmware wants less than the floor.
+                        // Re-hold immediately and re-baseline to the CURRENT temp
+                        // so we don't re-verify until it climbs another margin.
+                        try controller.setManual(true, fan: i)
+                        try controller.setTarget(rpm: floorRPM, fan: i)
+                        holding[i] = true
+                        holdBaselineTemp[i] = t
+                        blindTicks[i] = 0
+                        log?(String(format: "fan %d: temp rose but firmware still wants %.0f < floor %.0f — re-holding@%.0f (new base %.0f°C)  actual=%.0f",
+                                    i, intent, floorRPM, floorRPM, t, actual))
+                    }
                 } else {
+                    // BLIND FAIL-SAFE: temperature is unreadable, so we CANNOT
+                    // verify the firmware's intent. Release to AUTO and trust the
+                    // firmware (the real thermal backstop) — do not verify.
                     let blind = (blindTicks[i] ?? 0) + 1
                     try controller.setManual(false, fan: i)
                     holding[i] = false

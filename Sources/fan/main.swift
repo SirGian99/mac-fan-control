@@ -15,7 +15,7 @@ func usage() {
       sudo fan max             Force all fans to their maximum
       sudo fan auto [-f IDX]   Restore automatic fan control (all fans,
                                or only fan IDX)
-      sudo fan supervise <rpm> [--interval MS] [--temp-margin C] [--epsilon RPM] [--once]
+      sudo fan supervise <rpm> [--interval MS] [--temp-margin C] [--epsilon RPM] [--verify-settle MS] [--once]
                                Enforce a software minimum-RPM floor: keep fans
                                in macOS auto whenever the firmware wants >= the
                                floor, forcing them up to the floor only while
@@ -125,8 +125,9 @@ do {
         requireRoot("supervise \(Int(rpm))")
 
         let intervalMs = Int(optValue(args, "--interval") ?? "") ?? 2000
-        let tempMargin = Double(optValue(args, "--temp-margin") ?? "") ?? 4.0
+        let tempMargin = Double(optValue(args, "--temp-margin") ?? "") ?? 10.0
         let epsilon    = Double(optValue(args, "--epsilon") ?? "") ?? 50
+        let verifySettleMs = Int(optValue(args, "--verify-settle") ?? "") ?? 800
 
         let supervisor = MinFloorSupervisor(
             controller: fc,
@@ -134,6 +135,7 @@ do {
             intervalMs: intervalMs,
             releaseTempMarginC: tempMargin,
             epsilonRPM: epsilon,
+            verifySettleMs: verifySettleMs,
             log: { print($0) }
         )
 
@@ -144,10 +146,11 @@ do {
             print("Done; automatic fan control restored.")
         } else {
             print("Minimum-fan-speed supervisor")
-            print("  floor       = \(Int(rpm)) rpm")
-            print("  interval    = \(intervalMs) ms")
-            print(String(format: "  temp-margin = %.1f C", tempMargin))
-            print("  epsilon     = \(Int(epsilon)) rpm")
+            print("  floor        = \(Int(rpm)) rpm")
+            print("  interval     = \(intervalMs) ms")
+            print(String(format: "  temp-margin  = %.1f C", tempMargin))
+            print("  epsilon      = \(Int(epsilon)) rpm")
+            print("  verify-settle = \(verifySettleMs) ms")
             print("Fans stay in macOS auto whenever the firmware wants >= floor; forced up to the floor only while cool.")
             print("A held fan is left STEADY and handed back to macOS when temperature climbs — no periodic probing.")
             print("Press Ctrl-C to stop (restores automatic).")
