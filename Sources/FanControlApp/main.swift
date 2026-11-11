@@ -36,13 +36,13 @@ final class FanModel: ObservableObject {
     private let controller: FanController?
 
     // Per-fan floor supervisor state (mirrors MinFloorSupervisor). `sliderRPM`
-    // is the floor value.
-    private var holding: [Int: Bool] = [:]
-    private var holdBaselineTemp: [Int: Double] = [:]
-    private var blindTicks: [Int: Int] = [:]
-    private let releaseTempMarginC = 4.0
-    private let epsilonRPM = 50.0
-    private let blindProbeTicks = 15   // ~30s at 2s ticks
+    // is the floor value; `lastTarget` is the last commanded RPM per fan and
+    // `lastStepIndex` the current curve band per fan, so we only re-issue a
+    // privileged write when the stepped target moves meaningfully.
+    private var lastTarget: [Int: Double] = [:]
+    private var lastStepIndex: [Int: Int] = [:]
+    private let hysteresisC = 5.0
+    private let writeDeltaRPM = 25.0
 
     init() {
         controller = try? FanController()
@@ -51,7 +51,13 @@ final class FanModel: ObservableObject {
             && FileManager.default.fileExists(atPath: installedHelper)
         mode = FanControlMode(rawValue: UserDefaults.standard.string(forKey: "fanControlMode") ?? "") ?? .automatic
         refresh()
-        if let f = fans.first { sliderRPM = f.target > 0 ? f.target : f.actual }
+        // Default the floor to the saved value, or to the fan's real minimum RPM
+        // — NOT the current fan speed, which isn't "the minimum".
+        if let saved = UserDefaults.standard.object(forKey: "floorRPM") as? Double, saved > 0 {
+            sliderRPM = min(max(saved, minRPM), maxRPM)
+        } else {
+            sliderRPM = minRPM
+        }
 
         // Launch reconciliation: if Minimum was on but we can't act silently
         // (no passwordless helper yet), start clean in Automatic to avoid a
@@ -77,7 +83,7 @@ final class FanModel: ObservableObject {
                 if f.minRPM > 0 { minRPM = f.minRPM }
                 if f.maxRPM > 0 { maxRPM = f.maxRPM }
                 if mode == .automatic && (sliderRPM < minRPM || sliderRPM > maxRPM) {
-                    sliderRPM = min(max(f.actual, minRPM), maxRPM)
+                    sliderRPM = min(max(sliderRPM, minRPM), maxRPM)
                 }
             }
             status = s.fans.isEmpty ? "No fans found" : ""
@@ -123,7 +129,8 @@ final class FanModel: ObservableObject {
         }
         mode = newMode
         UserDefaults.standard.set(newMode.rawValue, forKey: "fanControlMode")
-        holding.removeAll(); holdBaselineTemp.removeAll(); blindTicks.removeAll()
+        lastTarget.removeAll()
+        lastStepIndex.removeAll()
         switch newMode {
         case .automatic:
             runPrivileged(["auto"])
@@ -133,20 +140,25 @@ final class FanModel: ObservableObject {
     }
 
     func applySpeed() {
+        // Remember the chosen floor so it persists across launches.
+        UserDefaults.standard.set(sliderRPM, forKey: "floorRPM")
         switch mode {
         case .automatic:
             break
         case .minimum:
-            // push the new floor immediately to any fan currently being held
-            let floor = Int(sliderRPM.rounded())
-            for (i, held) in holding where held {
-                runPrivileged(["set", String(floor), "-f", String(i)])
-            }
+            // Re-apply immediately with the new floor.
+            lastTarget.removeAll()
+            lastStepIndex.removeAll()
+            superviseTick()
         }
     }
 
-    /// One iteration of the per-fan floor supervisor, sharing `floorFanAction`
-    /// with the CLI's MinFloorSupervisor.
+    /// One iteration of the per-fan floor supervisor, sharing `fanCurveStep` /
+    /// `fanCurveTarget` with the CLI's MinFloorSupervisor. Fans are always driven
+    /// (never released), with the target following a stepped temperature curve:
+    /// the floor when cool, stepping up toward each fan's max as the machine
+    /// heats up. Within a band the target is constant (with hysteresis at the
+    /// boundaries), so it changes only when temperature crosses a threshold.
     func superviseTick() {
         guard mode == .minimum, let c = controller else { return }
         let floor = sliderRPM.rounded()
@@ -155,25 +167,15 @@ final class FanModel: ObservableObject {
         guard let s = try? c.status(), !s.fans.isEmpty else { return }
         for f in s.fans {
             let i = f.index
-            let action = floorFanAction(
-                holding: holding[i] ?? false,
-                firmwareTarget: f.target,
-                machineTemp: machineTemp,
-                holdBaseline: holdBaselineTemp[i],
-                priorBlindTicks: blindTicks[i] ?? 0,
-                floorRPM: floor, epsilonRPM: epsilonRPM,
-                releaseTempMarginC: releaseTempMarginC, blindProbeTicks: blindProbeTicks)
-            switch action {
-            case .enterHold:
-                runPrivileged(["set", String(Int(floor)), "-f", String(i)])
-                holding[i] = true; holdBaselineTemp[i] = machineTemp; blindTicks[i] = 0
-            case .release:
-                runPrivileged(["auto", "-f", String(i)])
-                holding[i] = false; holdBaselineTemp[i] = nil; blindTicks[i] = 0
-            case .stayHold:
-                if machineTemp == nil { blindTicks[i] = (blindTicks[i] ?? 0) + 1 } else { blindTicks[i] = 0 }
-            case .stayAuto:
-                break
+            let idx = fanCurveStep(current: lastStepIndex[i] ?? 0, machineTemp: machineTemp,
+                                   curve: defaultFanCurve, hysteresisC: hysteresisC)
+            lastStepIndex[i] = idx
+            let target = fanCurveTarget(stepIndex: idx, floorRPM: floor,
+                                        fanMaxRPM: f.maxRPM, curve: defaultFanCurve)
+            let last = lastTarget[i]
+            if !f.manual || last == nil || abs(target - (last ?? -1)) >= writeDeltaRPM {
+                runPrivileged(["set", String(Int(target.rounded())), "-f", String(i)])
+                lastTarget[i] = target
             }
         }
     }
@@ -366,7 +368,7 @@ struct FanView: View {
     private var modeCaption: String {
         switch model.mode {
         case .automatic: return "macOS controls the fans automatically."
-        case .minimum: return "Fans won’t drop below this, but macOS can still speed them up under load."
+        case .minimum: return "Fans won’t drop below this, and step up in stages as your Mac heats up."
         }
     }
 
@@ -438,7 +440,9 @@ struct FanView: View {
                     .font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if model.mode == .minimum {
-                    Text(model.manual ? "Holding floor" : "Auto — above floor")
+                    let topTarget = model.fans.map { $0.target }.max() ?? 0
+                    let ramping = topTarget > model.sliderRPM + 100
+                    Text(ramping ? "Ramping · \(Int(topTarget)) rpm" : "At minimum")
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }

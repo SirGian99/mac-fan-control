@@ -233,34 +233,50 @@ public final class FanController {
     }
 }
 
-// MARK: - Shared floor decision
+// MARK: - Shared stepped fan curve
 
-public enum FloorAction: Equatable { case stayAuto, enterHold, stayHold, release }
-
-/// Pure per-fan decision for the minimum-RPM floor supervisor.
-/// `firmwareTarget` is the fan's F{n}Tg — it equals the firmware's live intent
-/// ONLY when the fan is NOT holding. While holding we don't probe; we watch
-/// temperature and release once it climbs past the baseline (+margin). If temp
-/// is unreadable, `priorBlindTicks` accumulates and we release as a fail-safe.
-public func floorFanAction(holding: Bool,
-                           firmwareTarget: Double,
-                           machineTemp: Double?,
-                           holdBaseline: Double?,
-                           priorBlindTicks: Int,
-                           floorRPM: Double,
-                           epsilonRPM: Double,
-                           releaseTempMarginC: Double,
-                           blindProbeTicks: Int) -> FloorAction {
-    if holding {
-        if let t = machineTemp, let b = holdBaseline {
-            return t > b + releaseTempMarginC ? .release : .stayHold
-        } else {
-            // this tick is blind: if it pushes us to the threshold, release
-            return (priorBlindTicks + 1 >= blindProbeTicks) ? .release : .stayHold
-        }
-    } else {
-        return firmwareTarget < floorRPM - epsilonRPM ? .enterHold : .stayAuto
+/// One band of the stepped fan curve: at temperatures >= `minTempC`, run at
+/// `fraction` of the [floor, max] range (0 = floor, 1 = each fan's max).
+public struct FanCurveStep: Equatable {
+    public let minTempC: Double
+    public let fraction: Double
+    public init(minTempC: Double, fraction: Double) {
+        self.minTempC = minTempC; self.fraction = fraction
     }
+}
+
+/// Default stepped curve: floor while cool, stepping up to max as it heats.
+public let defaultFanCurve: [FanCurveStep] = [
+    FanCurveStep(minTempC: 0,  fraction: 0.0),    // floor below 60 °C
+    FanCurveStep(minTempC: 60, fraction: 0.25),
+    FanCurveStep(minTempC: 70, fraction: 0.50),
+    FanCurveStep(minTempC: 80, fraction: 0.75),
+    FanCurveStep(minTempC: 88, fraction: 1.0),     // max at/above 88 °C
+]
+
+/// Pick the curve step index for the current temperature, starting from
+/// `current`, with downward hysteresis so the fan doesn't flap at a boundary:
+/// step UP as soon as temp reaches the next band's `minTempC`; step DOWN only
+/// once temp falls `hysteresisC` below the current band's `minTempC`. Returns
+/// `current` (clamped) unchanged when temperature is unreadable.
+public func fanCurveStep(current: Int, machineTemp: Double?,
+                         curve: [FanCurveStep], hysteresisC: Double) -> Int {
+    guard !curve.isEmpty else { return 0 }
+    let clampedCurrent = min(max(current, 0), curve.count - 1)
+    guard let t = machineTemp else { return clampedCurrent }
+    var idx = clampedCurrent
+    while idx + 1 < curve.count && t >= curve[idx + 1].minTempC { idx += 1 }
+    while idx > 0 && t < curve[idx].minTempC - hysteresisC { idx -= 1 }
+    return idx
+}
+
+/// Target RPM for a step: floor + fraction*(max - floor), never below the floor.
+public func fanCurveTarget(stepIndex: Int, floorRPM: Double, fanMaxRPM: Double,
+                           curve: [FanCurveStep]) -> Double {
+    let ceiling = max(fanMaxRPM, floorRPM)
+    guard !curve.isEmpty else { return floorRPM }
+    let frac = curve[min(max(stepIndex, 0), curve.count - 1)].fraction
+    return floorRPM + max(0.0, min(frac, 1.0)) * (ceiling - floorRPM)
 }
 
 // MARK: - Minimum-RPM supervisor
@@ -269,144 +285,75 @@ public func floorFanAction(holding: Bool,
 /// minimum key (`F{n}Mn`) is read-only (firmware rejects writes with 0x86), so
 /// there is no native "auto-with-a-floor" mode.
 ///
-/// Strategy: leave a fan in firmware AUTO whenever the firmware itself already
-/// wants to spin at/above the user's floor (so it ramps freely under load), and
-/// only switch it to FORCED-at-floor when the machine is cool enough that the
-/// firmware would otherwise idle the fan below the floor.
-///
-/// Key subtlety: while a fan is FORCED, `F{n}Tg` reflects OUR forced value, not
-/// the firmware's intent — so we can only read the firmware's true desired
-/// target while the fan is in AUTO. To avoid physically disturbing a held fan
-/// just to probe (which makes it audibly oscillate), we do NOT release it on a
-/// timer. Instead, while holding, we keep the fan steady and watch temperature
-/// (read-only); we hand it back to the firmware only once temps climb past where
-/// the hold began, at which point the firmware's live `F{n}Tg` drives the ramp.
+/// Strategy: keep every fan FORCED and drive its target ourselves along a
+/// STEPPED temperature curve — the user's floor while cool, jumping up a band at
+/// a time toward the fan's max as the machine heats up (see `fanCurveStep` /
+/// `fanCurveTarget`). Within a band the target is constant, so the fans change
+/// only when the temperature crosses a boundary; downward hysteresis keeps them
+/// from flapping at a threshold. We NEVER release a fan to firmware AUTO while
+/// supervising: on this hardware the firmware idles fans to 0 rpm until quite
+/// warm, so any release while cool stalls them (and re-spinning from a dead stop
+/// takes seconds). Because we always drive the fans, they can't stall; they
+/// still step up under load because we step them. Apple's hardware thermal
+/// throttle remains the ultimate backstop.
 public final class MinFloorSupervisor {
     private let controller: FanController
     private let floorRPM: Double
     private let intervalMs: Int
-    private let releaseTempMarginC: Double
-    private let epsilonRPM: Double
+    private let curve: [FanCurveStep]
+    private let hysteresisC: Double
+    private let writeDeltaRPM: Double
     private let log: ((String) -> Void)?
 
-    /// Per-fan state (keyed by fan index): are we currently forcing this fan up
-    /// to the floor? Persisted across `stepOnce()` calls.
-    private var holding: [Int: Bool] = [:]
-    /// Machine temperature (°C) captured when a fan last entered HOLD. While a
-    /// fan is held we leave it physically STEADY and only hand it back to the
-    /// firmware once the temperature has climbed past this baseline + margin —
-    /// so we never disturb the fan just to probe the firmware's intent.
-    private var holdBaselineTemp: [Int: Double] = [:]
-    /// Consecutive ticks a held fan has seen an UNREADABLE temperature. After
-    /// enough of them we release once as a fail-safe (see `blindProbeTicks`).
-    private var blindTicks: [Int: Int] = [:]
+    /// Per-fan last commanded target (keyed by fan index), so we only re-write
+    /// the SMC when the target moves meaningfully. Persisted across `stepOnce()`.
+    private var lastTarget: [Int: Double] = [:]
+
+    /// Per-fan current curve band index, so hysteresis can be applied relative
+    /// to the band we're already in. Persisted across `stepOnce()`.
+    private var lastStepIndex: [Int: Int] = [:]
 
     public init(controller: FanController,
                 floorRPM: Double,
                 intervalMs: Int = 2000,
-                releaseTempMarginC: Double = 4.0,
-                epsilonRPM: Double = 50,
+                curve: [FanCurveStep] = defaultFanCurve,
+                hysteresisC: Double = 5,
+                writeDeltaRPM: Double = 25,
                 log: ((String) -> Void)? = nil) {
         self.controller = controller
         self.floorRPM = floorRPM
         self.intervalMs = intervalMs
-        self.releaseTempMarginC = releaseTempMarginC
-        self.epsilonRPM = epsilonRPM
+        self.curve = curve
+        self.hysteresisC = hysteresisC
+        self.writeDeltaRPM = writeDeltaRPM
         self.log = log
     }
-
-    /// If temperature is unreadable for this many consecutive ticks while
-    /// holding, release once so the firmware (the real thermal backstop) can
-    /// re-evaluate. ~30s worth of ticks. Never hit when sensors are readable.
-    private var blindProbeTicks: Int { max(1, 30_000 / max(1, intervalMs)) }
 
     /// One iteration of the control logic (extracted so it can be driven once
     /// for testing via the CLI's `--once` flag).
     public func stepOnce() throws {
         let n = try controller.fanCount()
-
-        // Machine temperature (°C), read-only — does NOT disturb the fans. This
-        // is the signal we use to decide when a held fan should be handed back to
-        // the firmware, instead of physically releasing it to probe (which is
-        // what caused the fan to audibly oscillate).
         let temps = controller.temperatures()
         let machineTemp = [temps.cpu, temps.gpu].compactMap { $0 }.max()
-        let tempStr = machineTemp.map { String(format: "%.0f°C", $0) } ?? "?"
-
         for i in 0..<n {
             let info = try controller.fan(i)
-            let actual = info.actual
-
-            // Single shared decision, identical to the one the GUI uses.
-            let action = floorFanAction(
-                holding: holding[i] == true,
-                firmwareTarget: info.target,
-                machineTemp: machineTemp,
-                holdBaseline: holdBaselineTemp[i],
-                priorBlindTicks: blindTicks[i] ?? 0,
-                floorRPM: floorRPM,
-                epsilonRPM: epsilonRPM,
-                releaseTempMarginC: releaseTempMarginC,
-                blindProbeTicks: blindProbeTicks)
-
-            switch action {
-            case .stayAuto:
-                // AUTO: the fan is under firmware control, so `target` is the
-                // firmware's LIVE desired speed — reading it disturbs nothing.
-                // Firmware already wants >= the floor: leave it in AUTO so it
-                // ramps freely (the loaded/warm case).
-                log?(String(format: "fan %d: AUTO (free ramp)  intent=%.0f  floor=%.0f  actual=%.0f",
-                            i, info.target, floorRPM, actual))
-
-            case .enterHold:
-                // Firmware would idle below the floor: force up to the floor
-                // and remember the temperature at which we started holding.
+            let idx = fanCurveStep(current: lastStepIndex[i] ?? 0, machineTemp: machineTemp,
+                                   curve: curve, hysteresisC: hysteresisC)
+            lastStepIndex[i] = idx
+            let target = fanCurveTarget(stepIndex: idx, floorRPM: floorRPM,
+                                        fanMaxRPM: info.maxRPM, curve: curve)
+            // (Re)assert when the fan isn't forced yet (self-heal after sleep/wake) or
+            // the target moved enough. setTarget clamps to the fan's [Mn, Mx].
+            // Within a band the target is constant, so no rewrites — exactly the
+            // "changes only at thresholds" behavior wanted.
+            let last = lastTarget[i]
+            if !info.manual || last == nil || abs(target - (last ?? -1)) >= writeDeltaRPM {
                 try controller.setManual(true, fan: i)
-                try controller.setTarget(rpm: floorRPM, fan: i)
-                holding[i] = true
-                holdBaselineTemp[i] = machineTemp
-                blindTicks[i] = 0
-                log?(String(format: "fan %d: AUTO -> HOLD@%.0f (intent=%.0f, base %@)  actual=%.0f",
-                            i, floorRPM, info.target, tempStr, actual))
-
-            case .stayHold:
-                // HOLD: the fan is forced up to the floor. Keep it STEADY.
-                // Re-assert the target only (idempotent, no md toggle) so there
-                // is no physical disturbance.
-                if machineTemp != nil, let b = holdBaselineTemp[i] {
-                    blindTicks[i] = 0
-                    try controller.setTarget(rpm: floorRPM, fan: i)
-                    log?(String(format: "fan %d: HOLD@%.0f steady (temp %@, base %.0f°C)  actual=%.0f",
-                                i, floorRPM, tempStr, b, actual))
-                } else {
-                    // Temperature unreadable: don't react to a transient miss.
-                    let blind = (blindTicks[i] ?? 0) + 1
-                    blindTicks[i] = blind
-                    try controller.setTarget(rpm: floorRPM, fan: i)
-                    log?(String(format: "fan %d: HOLD@%.0f steady (temp unreadable %d/%d)  actual=%.0f",
-                                i, floorRPM, blind, blindProbeTicks, actual))
-                }
-
-            case .release:
-                // Hand the fan back to the firmware — either the machine warmed
-                // past the baseline, or (fail-safe) temperature has been
-                // unreadable for too long.
-                if let t = machineTemp, let b = holdBaselineTemp[i] {
-                    try controller.setManual(false, fan: i)   // release to AUTO
-                    holding[i] = false
-                    holdBaselineTemp[i] = nil
-                    blindTicks[i] = 0
-                    log?(String(format: "fan %d: HOLD -> release to AUTO (temp %.0f°C > base %.0f+%.0f)  actual=%.0f",
-                                i, t, b, releaseTempMarginC, actual))
-                } else {
-                    let blind = (blindTicks[i] ?? 0) + 1
-                    try controller.setManual(false, fan: i)
-                    holding[i] = false
-                    holdBaselineTemp[i] = nil
-                    blindTicks[i] = 0
-                    log?(String(format: "fan %d: HOLD -> release to AUTO (temp unreadable for %d ticks, fail-safe)  actual=%.0f",
-                                i, blind, actual))
-                }
+                try controller.setTarget(rpm: target, fan: i)
+                lastTarget[i] = target
+                let tstr = machineTemp.map { String(format: "%.0f°C", $0) } ?? "?"
+                log?(String(format: "fan %d: %@ -> band %d = %.0f rpm (floor %.0f, max %.0f)  actual=%.0f",
+                            i, tstr, idx, target, floorRPM, info.maxRPM, info.actual))
             }
         }
     }

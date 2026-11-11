@@ -13,11 +13,12 @@
 
 Give your Mac's fans a **minimum speed floor** — or hand them fully back to
 macOS — straight from the menu bar or the terminal. The floor keeps the fans
-from idling too slow for your taste while leaving the firmware free to ramp them
-*higher* under load; macOS stays the thermal boss at all times. No kernel
-extensions, no background daemons, no third-party libraries — just a direct
-read/write conversation with the **System Management Controller (SMC)** over
-IOKit.
+from idling too slow for your taste, and the app steps them up in stages along a
+**stepped temperature curve** as the machine heats up (a fixed speed per
+temperature band, changing only when it crosses a threshold); macOS's hardware
+thermal throttle stays the ultimate backstop at all times. No kernel extensions,
+no background daemons, no third-party libraries — just a direct read/write
+conversation with the **System Management Controller (SMC)** over IOKit.
 
 > The power-user CLI can still hard-pin the fans to an exact RPM (`fan set`), but
 > the menu bar app only ever raises the *minimum* — it never caps how fast the
@@ -33,8 +34,8 @@ IOKit.
 
 - 📊 **Live RPM readout** for every fan
 - 🌡️ **CPU & GPU temperatures**, shown in your system's unit (°C / °F)
-- 🎚️ **Minimum fan speed** floor with a slider — fans never idle below it, but
-  the firmware can still ramp them higher under load
+- 🎚️ **Minimum fan speed** floor with a slider — fans never idle below it, and
+  the app steps them up in stages as your Mac heats up
 - 🔄 **Automatic** at any time — flip the switch off and macOS is fully back in
   control
 - 🖥️ A **menu bar app** (number-only readout) **and** a `fan` **CLI**, on one core
@@ -72,17 +73,33 @@ There is a catch that makes "auto, but never below N rpm" surprisingly hard: on
 Apple Silicon the hardware minimum register `F{n}Mn` is **read-only**. The SMC
 rejects any write to it (error `0x86`), so there is *no* native "auto-with-a-floor"
 hardware mode to set. The app emulates one using the only writable controls
-(`F{n}md` + `F{n}Tg`), deciding per fan on a short timer:
+(`F{n}md` + `F{n}Tg`) with an **app-driven stepped temperature curve**: on a
+short timer it keeps every fan **forced** and drives the target itself, holding a
+**fixed speed within each temperature band** and changing it only when the
+temperature crosses a threshold. The default curve (as a fraction of the range
+from the floor up to each fan's maximum) is:
 
-- **Firmware already wants ≥ the floor** (the machine is under load): leave the
-  fan in firmware **AUTO** so it ramps freely — the floor is a non-event.
-- **Firmware would idle the fan below the floor** (the machine is cool): force
-  the fan up to the floor and hold it there.
-- **While a fan is held at the floor**, it is kept **steady**. The app does *not*
-  release it on a timer to re-probe the firmware's intent — doing that made the
-  fan audibly oscillate. Instead it watches temperature (a read-only signal) and
-  hands the fan back to the firmware once temps climb past the point where the
-  hold began, at which moment the firmware's live target drives the ramp.
+| Temperature   | Fan speed                       |
+|---------------|---------------------------------|
+| below 60 °C   | floor                           |
+| 60 – 70 °C    | 25% of floor → max              |
+| 70 – 80 °C    | 50% of floor → max              |
+| 80 – 88 °C    | 75% of floor → max              |
+| 88 °C and up  | max                             |
+
+A small **~5 °C hysteresis** on the way down means a fan steps up as soon as the
+temperature reaches the next band, but only steps back down once it has cooled
+~3 °C below the band's threshold — so it doesn't flap back and forth at a
+boundary. Because the speed is constant within a band, the fans adjust only at
+these discrete thresholds rather than on every small temperature drift.
+
+The key design point is that the app **never releases the fans back to firmware
+AUTO while supervising**. On this hardware the firmware keeps fans at 0 rpm until
+quite warm, so *any* release while cool stalls them to a dead stop — and
+re-spinning up from zero takes seconds. Because the app always drives the fans,
+they can never stall to 0; they still step up under load because the app steps
+them. macOS's hardware thermal throttle remains the ultimate backstop and will
+override the fans if the machine gets too hot.
 
 The upshot: the floor only ever *raises* an idle fan; it never prevents the fan
 from speeding up.
@@ -138,8 +155,8 @@ open /Applications/FanControl.app
 Click the menu bar number to open the panel:
 
 - **Minimum fan speed** — a single on/off switch. Off = fully **Automatic**
-  (macOS controls the fans). On = the fans never idle below the chosen RPM, but
-  the firmware stays free to ramp them higher under load.
+  (macOS controls the fans). On = the fans never idle below the chosen RPM, and
+  the app steps them up in stages toward maximum as your Mac heats up.
 - **Speed** slider (enabled when Minimum is on) — sets the floor, bounded by the
   fans' reported min/max.
 - The **first time you turn Minimum on**, the app asks for your admin password
@@ -158,7 +175,7 @@ sudo fan set <rpm>        Force ALL fans to <rpm> rpm (hard pin)
 sudo fan set <rpm> -f N   Force only fan N
 sudo fan max              Force all fans to their maximum
 sudo fan auto [-f IDX]    Restore automatic control (all fans, or only fan IDX)
-sudo fan supervise <rpm> [--interval MS] [--temp-margin C] [--epsilon RPM] [--once]
+sudo fan supervise <rpm> [--interval MS] [--hysteresis C] [--once]
                           Run the minimum-RPM floor supervisor in the foreground
 ```
 
@@ -167,7 +184,7 @@ sudo fan supervise <rpm> [--interval MS] [--temp-margin C] [--epsilon RPM] [--on
 | `fan` / `fan status`        |  no   | Print each fan's RPM, min/max, target, mode         |
 | `fan status --json`         |  no   | Same, as JSON                                       |
 | `fan keys [F\|all\|PREFIX]` |  no   | Dump SMC keys; default prefix `F`, `all`/`""` = all |
-| `fan set <rpm>`             |  yes  | Hard-pin all fans to `<rpm>` (disables the ramp)    |
+| `fan set <rpm>`             |  yes  | Hard-pin all fans to `<rpm>` (disables the curve)   |
 | `fan set <rpm> -f <n>`      |  yes  | Hard-pin only fan `<n>`                             |
 | `fan max`                   |  yes  | Force all fans to their maximum                     |
 | `fan auto [-f <idx>]`       |  yes  | Hand control back to macOS (all fans, or fan `idx`) |
@@ -176,12 +193,16 @@ sudo fan supervise <rpm> [--interval MS] [--temp-margin C] [--epsilon RPM] [--on
 `fan set` is the classic hard pin: it forces the fans to an exact RPM and
 disables the firmware's thermal ramp until you run `fan auto` or reboot. If you
 want "never below N rpm, but free to go faster", use `fan supervise` instead —
-it runs the exact same minimum-floor logic the menu bar app uses, in the
-foreground, and restores automatic control on Ctrl-C. Its knobs: `--interval`
-(poll period, default 2000 ms), `--temp-margin` (°C rise above the hold baseline
-before a held fan is released, default 4.0), `--epsilon` (RPM slack when
-comparing the firmware's target to the floor, default 50), and `--once` (run a
-single control step and exit).
+it runs the exact same app-driven **stepped temperature curve** the menu bar app
+uses, in the foreground, and restores automatic control on Ctrl-C. It keeps the
+fans forced at all times (never releasing them, so they can't stall to 0) and
+drives the target along the curve (a fixed speed per temperature band — floor
+below 60 °C, then 25% / 50% / 75% of the floor→max range at 60 / 70 / 80 °C, and
+each fan's max at 88 °C), changing speed only when the temperature crosses a
+threshold. Its knobs: `--interval` (poll period, default 2000 ms), `--hysteresis`
+(how far below a band's threshold the temperature must fall before stepping back
+down, default 5 °C — keeps the fans from flapping at a boundary), and `--once`
+(run a single control step and exit).
 
 Example:
 
@@ -194,7 +215,7 @@ GPU: 41°C
 
 $ sudo fan supervise 2500
 Minimum-fan-speed supervisor
-  floor       = 2500 rpm
+  floor     = 2500 rpm
   ...
 Press Ctrl-C to stop (restores automatic).
 
